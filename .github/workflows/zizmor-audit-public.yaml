@@ -7,13 +7,8 @@ jobs:
   zizmor-scan:
     name: Zizmor Scan
     if: github.base_ref == github.event.repository.default_branch
-    runs-on: lucca-ci
+    runs-on: ubuntu-latest
     timeout-minutes: 60
-    container:
-      image: "ghcr.io/luccasa/lucca-ci:v3@sha256:97fb9cb789492af5d8ffa7e03ed27a63e7f3146e7aea0c5be076423188cba9f5"
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.github_token }}
     permissions:
       contents: read
     steps:
