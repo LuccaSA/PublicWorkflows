@@ -1,0 +1,49 @@
+name: "Security: Zizmor scan"
+
+on:
+  pull_request:
+
+jobs:
+  zizmor-scan:
+    name: Zizmor Scan
+    if: github.base_ref == github.event.repository.default_branch
+    runs-on: lucca-ci
+    timeout-minutes: 60
+    container:
+      image: "ghcr.io/luccasa/lucca-ci:v3@sha256:97fb9cb789492af5d8ffa7e03ed27a63e7f3146e7aea0c5be076423188cba9f5"
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.github_token }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout PR code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Get changed workflow files
+        id: changed-files
+        uses: tj-actions/changed-files@22103cc46bda19c2b464ffe86db46df6922fd323 # v47.0.5
+        with:
+          files: |
+            .github/workflows/*.yml
+            .github/workflows/*.yaml
+
+      - name: Install uv
+        if: steps.changed-files.outputs.any_changed == 'true'
+        uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098 # v7.3.1
+        with:
+          enable-cache: false
+
+      - name: Run Zizmor on repository inputs
+        if: steps.changed-files.outputs.any_changed == 'true'
+        shell: bash
+        run: |
+          uvx zizmor@1.23.1 \
+            --persona auditor \
+            --min-severity high \
+            --min-confidence medium \
+            --format github \
+            ${{ steps.changed-files.outputs.all_changed_files }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UV_HTTP_TIMEOUT: 120
