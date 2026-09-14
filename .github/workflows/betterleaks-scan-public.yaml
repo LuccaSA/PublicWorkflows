@@ -18,8 +18,11 @@ on:
   merge_group:
 
 env:
-  # betterleaks release tag to install (see https://github.com/betterleaks/betterleaks/releases)
-  BETTERLEAKS_VERSION: "v1.8.1"
+  # betterleaks release tag to install, read from the BETTERLEAKS_VERSION
+  # Actions variable (organization or repository level) of the repository the
+  # workflow runs in, with a pinned fallback when the variable is not defined.
+  # See https://github.com/betterleaks/betterleaks/releases
+  BETTERLEAKS_VERSION: ${{ vars.BETTERLEAKS_VERSION || 'v1.8.1' }}
 
 # Effective permissions are declared per job below.
 permissions: {}
