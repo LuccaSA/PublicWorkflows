@@ -1,33 +1,27 @@
 name: "Security: Betterleaks scan"
 
-# Reusable secrets scan for pull requests, running betterleaks with its
-# DEFAULT rules (no custom betterleaks.toml) over the patches of the
-# commits introduced by the pull request (base..HEAD commit range).
+# Secrets scan for pull requests, running betterleaks with its DEFAULT rules
+# (no custom betterleaks.toml) over the patches of the commits introduced by
+# the pull request (base..HEAD commit range).
 #
-# Call it from a repository like this:
+# Meant to be enforced as a required check through an organization ruleset
+# ("Require workflows to pass before merging"), the same way as
+# zizmor-audit-public.yaml: the ruleset points at this file and GitHub runs it
+# in the context of the target repository on every pull request (and merge
+# queue entry), regardless of whether that repository defines any workflow.
 #
-#   name: Betterleaks Secrets Scanning
-#   on:
-#     pull_request:
-#     merge_group:
-#   jobs:
-#     secrets-scan:
-#       uses: LuccaSA/PublicWorkflows/.github/workflows/betterleaks-scan-public.yaml@main
-#       permissions:
-#         contents: read
-#         pull-requests: write
+# Ruleset-required workflows only run for the pull_request, pull_request_target
+# and merge_group events (any filters on those events are ignored).
 
 on:
-  workflow_call:
-    inputs:
-      betterleaks-version:
-        description: "betterleaks release tag to install (e.g. v1.8.1)"
-        required: false
-        type: string
-        default: "v1.8.1"
+  pull_request:
+  merge_group:
 
-# Effective permissions are declared per job below (and can only be a subset
-# of what the calling workflow grants).
+env:
+  # betterleaks release tag to install (see https://github.com/betterleaks/betterleaks/releases)
+  BETTERLEAKS_VERSION: "v1.8.1"
+
+# Effective permissions are declared per job below.
 permissions: {}
 
 jobs:
@@ -49,7 +43,6 @@ jobs:
       - name: Install betterleaks
         shell: bash
         env:
-          BETTERLEAKS_VERSION: ${{ inputs.betterleaks-version }}
           GH_TOKEN: ${{ github.token }}
         run: |
           VERSION="${BETTERLEAKS_VERSION#v}"
@@ -145,6 +138,9 @@ jobs:
 
       - name: Comment on PR with findings
         if: always() && steps.annotations.outputs.has_findings == 'true' && github.event_name == 'pull_request'
+        # The check already fails from the annotations step above; the comment
+        # is best effort (the token is read-only for pull requests from forks).
+        continue-on-error: true
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         env:
           FINDINGS: ${{ steps.annotations.outputs.findings }}
