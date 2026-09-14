@@ -1,0 +1,245 @@
+name: "Security: Betterleaks scan"
+
+# Secrets scan for pull requests, running betterleaks with its DEFAULT rules
+# (no custom betterleaks.toml) over the patches of the commits introduced by
+# the pull request (base..HEAD commit range).
+#
+# Meant to be enforced as a required check through an organization ruleset
+# ("Require workflows to pass before merging"), the same way as
+# zizmor-audit-public.yaml: the ruleset points at this file and GitHub runs it
+# in the context of the target repository on every pull request (and merge
+# queue entry), regardless of whether that repository defines any workflow.
+#
+# Ruleset-required workflows only run for the pull_request, pull_request_target
+# and merge_group events (any filters on those events are ignored).
+
+on:
+  pull_request:
+  merge_group:
+
+env:
+  # betterleaks release tag to install, read from the BETTERLEAKS_VERSION
+  # Actions variable (organization or repository level) of the repository the
+  # workflow runs in, with a pinned fallback when the variable is not defined.
+  # See https://github.com/betterleaks/betterleaks/releases
+  BETTERLEAKS_VERSION: ${{ vars.BETTERLEAKS_VERSION || 'v1.8.1' }}
+
+# Effective permissions are declared per job below.
+permissions: {}
+
+jobs:
+  secrets-scan:
+    name: Secrets Scan (default rules)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read # clone the repository with full history for the commit-range scan
+      pull-requests: write # comment on the PR when findings are detected
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install betterleaks
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${BETTERLEAKS_VERSION#v}"
+          INSTALL_DIR="$HOME/.local/bin"
+          mkdir -p "$INSTALL_DIR"
+
+          echo "Installing betterleaks v${VERSION}..."
+          ASSET="betterleaks_${VERSION}_linux_x64.tar.gz"
+          BASE_URL="https://github.com/betterleaks/betterleaks/releases/download/v${VERSION}"
+
+          gh release verify "v${VERSION}" --repo betterleaks/betterleaks
+
+          curl -fsSL --retry 3 --retry-all-errors \
+            "${BASE_URL}/${ASSET}" \
+            -o "/tmp/${ASSET}"
+          curl -fsSL --retry 3 --retry-all-errors \
+            "${BASE_URL}/checksums.txt" \
+            -o /tmp/betterleaks-checksums.txt
+          (cd /tmp && sha256sum --check --ignore-missing betterleaks-checksums.txt)
+
+          gh release verify-asset "v${VERSION}" "/tmp/${ASSET}" --repo betterleaks/betterleaks
+
+          tar -xzf "/tmp/${ASSET}" -C /tmp betterleaks
+          install -m 755 /tmp/betterleaks "$INSTALL_DIR/betterleaks"
+          rm -f "/tmp/${ASSET}" /tmp/betterleaks /tmp/betterleaks-checksums.txt
+          echo "$INSTALL_DIR" >> "$GITHUB_PATH"
+          echo "Installed betterleaks to $INSTALL_DIR/betterleaks"
+
+      - name: Run betterleaks on the PR commit range (default rules)
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: |
+          ARGS=()
+          # Scan the patches of every commit introduced by the PR / merge
+          # group, so a secret added then removed within the PR is still
+          # caught; fall back to full history when the triggering event has
+          # no base SHA.
+          if [ -n "${BASE_SHA}" ]; then
+            ARGS+=(--log-opts "${BASE_SHA}..HEAD")
+          fi
+          betterleaks git \
+            "${ARGS[@]}" \
+            --report-format json \
+            --report-path /tmp/betterleaks-results.json || true
+
+      - name: Emit GitHub annotations for findings
+        id: annotations
+        if: always()
+        shell: bash
+        run: |
+          RESULTS=/tmp/betterleaks-results.json
+
+          # Normalize to a valid JSON array so jq never chokes.
+          if [ ! -s "$RESULTS" ] || [ "$(cat "$RESULTS")" = 'null' ]; then echo '[]' > "$RESULTS"; fi
+
+          TOTAL_FINDINGS=$(jq -r 'length' "$RESULTS")
+          echo "Found $TOTAL_FINDINGS secret(s) in the PR commit range"
+
+          if [ "$TOTAL_FINDINGS" -eq 0 ]; then
+            echo "No secrets found."
+            echo "has_findings=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "has_findings=true" >> "$GITHUB_OUTPUT"
+          DELIM="EOF_$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+          {
+            echo "findings<<${DELIM}"
+            cat "$RESULTS"
+            echo "${DELIM}"
+          } >> "$GITHUB_OUTPUT"
+
+          # Emit one annotation per finding, pointing at the real file/line so
+          # GitHub attaches it to the source (inline on the PR diff when the line
+          # is part of the diff, and always in the run's annotation summary).
+          # A workflow command must be a single line, so collapse the message.
+          while IFS= read -r finding; do
+            [ -z "$finding" ] && continue
+            file=$(printf '%s' "$finding" | jq -r '.File // ""')
+            line=$(printf '%s' "$finding" | jq -r '.StartLine // 1')
+            endline=$(printf '%s' "$finding" | jq -r '.EndLine // .StartLine // 1')
+            col=$(printf '%s' "$finding" | jq -r '.StartColumn // 1')
+            endcol=$(printf '%s' "$finding" | jq -r '.EndColumn // .StartColumn // 1')
+            rule=$(printf '%s' "$finding" | jq -r '.RuleID // "secret"')
+            desc=$(printf '%s' "$finding" | jq -r '.Description // "Potential secret detected"' | tr '\n' ' ')
+
+            [ -z "$file" ] && continue
+            echo "::error file=${file},line=${line},endLine=${endline},col=${col},endColumn=${endcol},title=Betterleaks: ${rule}::${desc}"
+          done < <(jq -c '.[]' "$RESULTS" 2>/dev/null)
+
+          exit 1
+
+      - name: Comment on PR with findings
+        if: always() && steps.annotations.outputs.has_findings == 'true' && github.event_name == 'pull_request'
+        # The check already fails from the annotations step above; the comment
+        # is best effort (the token is read-only for pull requests from forks).
+        continue-on-error: true
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          FINDINGS: ${{ steps.annotations.outputs.findings }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const raw = process.env.FINDINGS;
+            let findings;
+            try { findings = JSON.parse(raw); } catch { findings = []; }
+            if (!findings.length) return;
+
+            const headSha = context.payload.pull_request.head.sha;
+            const lines = findings.map(f => {
+              const file = f.File || 'unknown';
+              const line = f.StartLine || '?';
+              const rule = f.RuleID || 'secret';
+              const desc = f.Description || 'Potential secret detected';
+              const commit = f.Commit ? ` (commit \`${f.Commit.slice(0, 8)}\`)` : '';
+              const permalink = `https://github.com/${context.repo.owner}/${context.repo.repo}/blob/${f.Commit || headSha}/${file}#L${line}`;
+              return `🔴 **[${rule}](${permalink})** in \`${file}:${line}\`${commit}\n   ${desc}`;
+            }).join('\n\n');
+
+            // Build per-commit rebase guidance
+            const badCommits = [...new Set(findings.map(f => f.Commit).filter(Boolean))];
+            const firstBadCommit = badCommits[0];
+            const rebaseInstructions = firstBadCommit ? [
+              '### How to fix: rewrite the offending commit(s)',
+              '',
+              '> ⚠️ Simply adding a new commit to remove the secret is **not enough** — this scanner checks the full commit history of the PR. You must rewrite history so the secret never appears in any commit.',
+              '',
+              '**Step 1 — Start an interactive rebase from just before the first offending commit:**',
+              '```sh',
+              `git rebase -i ${firstBadCommit}~1`,
+              '```',
+              '',
+              '**Step 2 — In the editor**, mark the offending commit(s) as `edit` (to amend them) or `drop` (to remove them entirely):',
+              '```',
+              badCommits.map(c => `edit ${c.slice(0, 8)}  ← contains secret`).join('\n'),
+              '```',
+              '',
+              '**Step 3 — For each commit marked `edit`**, git will pause. Remove the secret from the file, then:',
+              '```sh',
+              'git add <file>',
+              'git commit --amend --no-edit',
+              'git rebase --continue',
+              '```',
+              '',
+              '**Step 4 — Force-push your branch:**',
+              '```sh',
+              `git push --force-with-lease origin ${context.payload.pull_request.head.ref}`,
+              '```',
+              '',
+              '**Step 5 — Rotate the secret** — treat it as compromised regardless of how quickly it was removed.',
+            ].join('\n') : [
+              '### How to fix',
+              '',
+              '> ⚠️ Simply adding a new commit to remove the secret is **not enough** — this scanner checks the full commit history of the PR. You must rewrite history so the secret never appears in any commit.',
+              '',
+              'Use `git rebase -i <commit-before-leak>~1` to edit or drop the offending commit(s), then force-push.',
+              '',
+              '**Rotate the secret** — treat it as compromised regardless of how quickly it was removed.',
+            ].join('\n');
+
+            const marker = '<!-- betterleaks-scan-report -->';
+            const body = [
+              marker,
+              '## 🚨 Betterleaks Secret Findings',
+              '',
+              'Potential secrets were detected in the commits introduced by this PR:',
+              '',
+              lines,
+              '',
+              rebaseInstructions,
+            ].join('\n');
+
+            // Update the existing report comment instead of stacking a new
+            // one on every run.
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body,
+              });
+            }
