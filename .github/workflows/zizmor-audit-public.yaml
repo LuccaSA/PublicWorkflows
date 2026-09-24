@@ -32,12 +32,14 @@ jobs:
         if: steps.changed-files.outputs.any_changed == 'true'
         shell: bash
         run: |
+          read -ra files <<< "$ALL_CHANGED_FILES"
           uvx zizmor@1.23.1 \
             --persona auditor \
             --min-severity high \
             --min-confidence medium \
             --format github \
-            ${{ steps.changed-files.outputs.all_changed_files }}
+            "${files[@]}"
         env:
+          ALL_CHANGED_FILES: ${{ steps.changed-files.outputs.all_changed_files }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           UV_HTTP_TIMEOUT: 120
